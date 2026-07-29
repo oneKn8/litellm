@@ -56,6 +56,8 @@ from litellm._logging import verbose_logger
 from litellm.caching.caching import DualCache
 from litellm.proxy._experimental.mcp_server.oauth_utils import (
     TOKEN_NO_CACHE_HEADERS,
+    _canonical_resource_uri,
+    canonicalize_url_identity,
     get_request_base_url,
     is_loopback_redirect_host,
     validate_redirect_uri_shape,
@@ -73,10 +75,13 @@ from litellm.proxy._experimental.mcp_server.outbound_credentials.session_token i
     mint_session_refresh_token,
     mint_session_token,
 )
+from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.auth.ip_address_utils import IPAddressUtils
 from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     decrypt_value_helper,
     encrypt_value_helper,
 )
+from litellm.types.mcp_server.mcp_server_manager import MCPServer
 
 GATEWAY_DCR_CLIENT_ID_PREFIX: Final = "llm_dcrc_"
 """Marker prefix on every gateway-issued DCR client_id so the root authorize/token
@@ -169,6 +174,7 @@ class _ConnectFlow(BaseModel):
     code_challenge: str = Field(min_length=1)
     jti: str = Field(min_length=1)
     exp: int
+    resource_server_id: str | None = None
 
 
 class _GatewayAuthCode(BaseModel):
@@ -185,6 +191,7 @@ class _GatewayAuthCode(BaseModel):
     jti: str = Field(min_length=1)
     iat: int
     exp: int
+    resource_server_id: str | None = None
 
 
 def is_gateway_dcr_client_id(client_id: str | None) -> bool:
@@ -320,7 +327,92 @@ def relative_request_url(request: Request) -> str:
     return f"{path}?{request.url.query}" if request.url.query else path
 
 
-def aggregate_authorize(
+def resolve_scoped_resource_server(request: Request, resource: str | None) -> MCPServer | None:
+    """Resolve an RFC 8707 ``resource`` value to the single gateway-managed oauth2 server it
+    names, or ``None`` for every other shape: absent, the aggregate resource, a foreign
+    host, an unparseable value, a multi-server path, an unknown name, or any server mode the
+    keyless gateway flow does not serve (whose protected-resource metadata never directs a
+    client here). ``None`` means the flow stays unscoped and byte-identical to today, so a
+    hostile or confused ``resource`` can never widen anything; a resolved server only ever
+    NARROWS the session via the sealed scope."""
+    if resource is None:
+        return None
+    canonical = _canonical_resource_uri(resource)
+    if canonical is None:
+        return None
+    base = canonicalize_url_identity(get_request_base_url(request))
+    if canonical == f"{base}/mcp" or not canonical.startswith(f"{base}/"):
+        return None
+    from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import (  # noqa: PLC0415  # proxy import cycle
+        MCPRequestHandler,
+    )
+    from litellm.proxy._experimental.mcp_server.mcp_server_manager import (  # noqa: PLC0415  # proxy import cycle
+        global_mcp_server_manager,
+    )
+
+    names = MCPRequestHandler._extract_target_server_names_from_path(canonical[len(base) :])
+    if len(names) != 1:
+        return None
+    server = global_mcp_server_manager.get_mcp_server_by_name(
+        names[0], client_ip=IPAddressUtils.get_mcp_client_ip(request)
+    )
+    if server is None or not server.is_gateway_managed_oauth2:
+        return None
+    return server
+
+
+async def _scoped_flow_completes_silently(server: MCPServer, session_user_id: str) -> bool:
+    """True when the scoped server needs no interactive upstream consent from this user:
+    an M2M server (the gateway mints its own token at egress) or an interactive server
+    whose usable per-user token is already vaulted (refresh-aware, through the same
+    resolver egress uses). Classified via the same owners as the pre-emptive 401, so the
+    authorize decision and the connect-time challenge can never disagree."""
+    from litellm.proxy._experimental.mcp_server.mcp_server_manager import (  # noqa: PLC0415  # proxy import cycle
+        MCPServerManager,
+        global_mcp_server_manager,
+    )
+
+    if MCPServerManager.effective_oauth2_flow(server) == "client_credentials":
+        return True
+    return await global_mcp_server_manager.has_user_oauth_token(server, UserAPIKeyAuth(user_id=session_user_id))
+
+
+def _mint_code_redirect(
+    user_id: str,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    state: str,
+    resource_server_id: str | None,
+    now: datetime,
+    manual_delivery: bool = False,
+) -> Response:
+    """Seal the gateway authorization code and hand it back to the client: the one owner of
+    code minting, shared by the finish step and the silent scoped completion so the sealed
+    bindings cannot drift between the two paths. ``manual_delivery`` renders the callback
+    URL for the user to carry to the client's machine instead of following the 303."""
+    code_ttl: Final = MANUAL_DELIVERY_AUTH_CODE_TTL_SECONDS if manual_delivery else GATEWAY_AUTH_CODE_TTL_SECONDS
+    code: Final = _seal(
+        GATEWAY_AUTH_CODE_PREFIX,
+        _GatewayAuthCode(
+            user_id=user_id,
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            code_challenge=code_challenge,
+            jti=secrets.token_urlsafe(24),
+            iat=int(now.timestamp()),
+            exp=int(now.timestamp()) + code_ttl,
+            resource_server_id=resource_server_id,
+        ),
+    )
+    params: Final = {"code": code, **({"state": state} if state else {})}
+    callback_url: Final = _append_query_params(redirect_uri, params)
+    if manual_delivery:
+        return _manual_delivery_response(callback_url)
+    return RedirectResponse(callback_url, status_code=303)
+
+
+async def aggregate_authorize(
     request: Request,
     client_id: str,
     redirect_uri: str,
@@ -329,10 +421,17 @@ def aggregate_authorize(
     code_challenge_method: str | None,
     response_type: str | None,
     session_user_id: str | None,
+    resource: str | None = None,
 ) -> Response:
     """The aggregate authorize verb: validate the client, require S256 PKCE, interpose
     LiteLLM sign-in, and hand the browser to the connect page with the flow sealed into a
     per-flow cookie.
+
+    A per-server RFC 8707 ``resource`` naming a gateway-managed oauth2 server scopes the
+    flow to that one server (sealed into the flow, the code, and the session token). When
+    that server needs no interactive consent from this user (M2M, or a usable vaulted
+    token), the code is minted immediately and the browser never sees the connect page;
+    otherwise the connect page interlude runs as before with the scope sealed.
 
     Validation failures respond directly with 400 and never redirect: per RFC 6749
     section 4.1.2.1 an unvalidated redirect URI must not receive an error redirect, and
@@ -358,6 +457,17 @@ def aggregate_authorize(
         login_url: Final = f"{base_url}/sso/key/generate?{urlencode({'return_to': relative_request_url(request)})}"
         return RedirectResponse(login_url, status_code=303)
     now: Final = datetime.now(timezone.utc)
+    scoped_server: Final = resolve_scoped_resource_server(request, resource)
+    if scoped_server is not None and await _scoped_flow_completes_silently(scoped_server, session_user_id):
+        return _mint_code_redirect(
+            user_id=session_user_id,
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            code_challenge=code_challenge,
+            state=state,
+            resource_server_id=scoped_server.server_id,
+            now=now,
+        )
     handle: Final = secrets.token_urlsafe(24)
     flow: Final = _ConnectFlow(
         user_id=session_user_id,
@@ -367,6 +477,7 @@ def aggregate_authorize(
         code_challenge=code_challenge,
         jti=secrets.token_urlsafe(24),
         exp=int(now.timestamp()) + CONNECT_FLOW_TTL_SECONDS,
+        resource_server_id=scoped_server.server_id if scoped_server is not None else None,
     )
     connect_url: Final = _append_query_params(
         f"{base_url}/ui/connect",
@@ -444,23 +555,15 @@ async def complete_connect_flow(
     ):
         return _oauth_error(400, "invalid_request", "this connect flow was already completed; restart the connection")
     manual_delivery: Final = delivery == "manual" and is_loopback_redirect_host(urlparse(flow.redirect_uri))
-    code_ttl: Final = MANUAL_DELIVERY_AUTH_CODE_TTL_SECONDS if manual_delivery else GATEWAY_AUTH_CODE_TTL_SECONDS
-    code: Final = _seal(
-        GATEWAY_AUTH_CODE_PREFIX,
-        _GatewayAuthCode(
-            user_id=flow.user_id,
-            client_id=flow.client_id,
-            redirect_uri=flow.redirect_uri,
-            code_challenge=flow.code_challenge,
-            jti=secrets.token_urlsafe(24),
-            iat=int(now.timestamp()),
-            exp=int(now.timestamp()) + code_ttl,
-        ),
-    )
-    params: Final = {"code": code, **({"state": flow.state} if flow.state else {})}
-    callback_url: Final = _append_query_params(flow.redirect_uri, params)
-    response: Final[Response] = (
-        _manual_delivery_response(callback_url) if manual_delivery else RedirectResponse(callback_url, status_code=303)
+    response: Final = _mint_code_redirect(
+        user_id=flow.user_id,
+        client_id=flow.client_id,
+        redirect_uri=flow.redirect_uri,
+        code_challenge=flow.code_challenge,
+        state=flow.state,
+        resource_server_id=flow.resource_server_id,
+        now=now,
+        manual_delivery=manual_delivery,
     )
     path, secure = _cookie_path_and_secure(request)
     response.delete_cookie(key=_flow_cookie_name(flow_handle), path=path, secure=secure, httponly=True, samesite="lax")
@@ -587,6 +690,20 @@ def _reload_failure_response(failure: ReloadUserFailure) -> Response:
             assert_never(failure)
 
 
+def _resource_conflicts_with_scope(
+    request: Request, resource: str | None, sealed_resource_server_id: str | None
+) -> bool:
+    """True when a scoped grant is being redeemed for a DIFFERENT resource than the one
+    sealed into it (RFC 8707 section 2.2: reject with ``invalid_target``). An absent
+    ``resource`` never conflicts (the sealed scope still binds the minted session), and an
+    unscoped grant ignores the parameter entirely, exactly as the endpoint always has, so
+    no pre-existing client breaks."""
+    if sealed_resource_server_id is None or resource is None:
+        return False
+    resolved = resolve_scoped_resource_server(request, resource)
+    return resolved is None or resolved.server_id != sealed_resource_server_id
+
+
 async def aggregate_token(
     request: Request,
     grant_type: str,
@@ -598,6 +715,7 @@ async def aggregate_token(
     master_key: str | None,
     reload_user: ReloadUser,
     cache: DualCache,
+    resource: str | None = None,
 ) -> Response:
     """The aggregate token verb: authorization_code and refresh_token grants for the
     identity-only session pair. Every path re-validates the litellm user live before
@@ -609,10 +727,12 @@ async def aggregate_token(
     now: Final = datetime.now(timezone.utc)
     if grant_type == "authorization_code":
         return await _authorization_code_grant(
+            request=request,
             code=code,
             redirect_uri=redirect_uri,
             client_id=client_id,
             code_verifier=code_verifier,
+            resource=resource,
             keys=keys,
             now=now,
             reload_user=reload_user,
@@ -620,8 +740,10 @@ async def aggregate_token(
         )
     if grant_type == "refresh_token":
         return await _refresh_token_grant(
+            request=request,
             refresh_token=refresh_token,
             client_id=client_id,
+            resource=resource,
             keys=keys,
             now=now,
             reload_user=reload_user,
@@ -631,10 +753,12 @@ async def aggregate_token(
 
 
 async def _authorization_code_grant(
+    request: Request,
     code: str | None,
     redirect_uri: str | None,
     client_id: str,
     code_verifier: str | None,
+    resource: str | None,
     keys: SessionKeys,
     now: datetime,
     reload_user: ReloadUser,
@@ -651,6 +775,8 @@ async def _authorization_code_grant(
         return _oauth_error(400, "invalid_grant", "the authorization code has expired")
     if client_id != parsed.client_id or redirect_uri != parsed.redirect_uri:
         return _oauth_error(400, "invalid_grant", "the authorization code was issued to a different client")
+    if _resource_conflicts_with_scope(request, resource, parsed.resource_server_id):
+        return _oauth_error(400, "invalid_target", "resource does not match the scope this code was issued for")
     if not _pkce_verifier_matches(code_verifier, parsed.code_challenge):
         return _oauth_error(400, "invalid_grant", "PKCE verification failed")
     # Revalidate the user BEFORE claiming the code, so a transient DB outage (a retryable
@@ -666,12 +792,18 @@ async def _authorization_code_grant(
         parsed.exp - int(now.timestamp()) + _CLAIM_TTL_BUFFER_SECONDS,
     ):
         return _oauth_error(400, "invalid_grant", "the authorization code was already used")
-    return _session_token_pair(SessionPrincipal(user_id=parsed.user_id, client_id=client_id), keys, now)
+    return _session_token_pair(
+        SessionPrincipal(user_id=parsed.user_id, client_id=client_id, resource_server_id=parsed.resource_server_id),
+        keys,
+        now,
+    )
 
 
 async def _refresh_token_grant(
+    request: Request,
     refresh_token: str | None,
     client_id: str,
+    resource: str | None,
     keys: SessionKeys,
     now: datetime,
     reload_user: ReloadUser,
@@ -682,6 +814,8 @@ async def _refresh_token_grant(
     opened: Final = open_session_refresh_bearer(refresh_token, keys, now, expected_client_id=client_id)
     if not isinstance(opened, SessionRefreshOpened):
         return _oauth_error(400, "invalid_grant", "the refresh token is invalid for this client")
+    if _resource_conflicts_with_scope(request, resource, opened.principal.resource_server_id):
+        return _oauth_error(400, "invalid_target", "resource does not match the scope this token was issued for")
     failure: Final = await reload_user(opened.principal.user_id)
     if failure is not None:
         return _reload_failure_response(failure)
