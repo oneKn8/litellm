@@ -37,6 +37,10 @@ from litellm.llms.bedrock.common_utils import (
     normalize_tool_input_schema_types_for_bedrock_invoke,
     pop_bedrock_invoke_output_config_format,
 )
+from litellm.llms.bedrock.request_metadata import (
+    bedrock_request_metadata_header_pairs,
+    merge_bedrock_invoke_headers,
+)
 from litellm.types.llms.anthropic import (
     ANTHROPIC_BETA_HEADER_VALUES,
     ANTHROPIC_TOOL_SEARCH_BETA_HEADER,
@@ -89,7 +93,10 @@ class AmazonAnthropicClaudeMessagesConfig(
         api_key: str | None = None,
         api_base: str | None = None,
     ) -> tuple[dict, str | None]:
-        return headers, api_base
+        return (
+            merge_bedrock_invoke_headers(headers, bedrock_request_metadata_header_pairs(litellm_params)),
+            api_base,
+        )
 
     def sign_request(
         self,
