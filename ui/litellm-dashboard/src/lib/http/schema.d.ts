@@ -838,14 +838,15 @@ export interface paths {
         put?: never;
         /**
          * Start Shadow Eval
-         * @description Start a pre-adoption shadow eval: duplicate a sampled slice of a key's live traffic
-         *     through an auto-router, judge real vs. shadow responses blind, and stratify win rates
-         *     by the router's tier classification and by the incumbent model.
+         * @description Start a pre-adoption shadow eval: duplicate a sampled slice of one or more keys' live
+         *     traffic through an auto-router, judge real vs. shadow responses blind, and stratify win
+         *     rates by the router's tier classification, by the incumbent model, and by key.
          *
-         *     Shadow responses are never served to users. The job samples until it has judged
-         *     max_turns turns, reaches the end of its window, or is stopped; sampling changes
-         *     propagate to pods within about 10 seconds. Shadow and judge calls bill to the
-         *     shadowed key but are excluded from request counts and auto-router adoption metrics.
+         *     Shadow responses are never served to users. Each key samples until it has judged
+         *     max_turns turns of its own traffic, the job's window ends, or the job is stopped, so a
+         *     busy key running out of budget does not end sampling for the others; sampling changes
+         *     propagate to pods within about 10 seconds. Shadow and judge calls bill to the shadowed
+         *     key but are excluded from request counts and auto-router adoption metrics.
          */
         post: operations["start_shadow_eval_auto_router_shadow_eval_start_post"];
         delete?: never;
@@ -885,7 +886,9 @@ export interface paths {
         put?: never;
         /**
          * Stop Shadow Eval Job
-         * @description Stop an active shadow eval job. Attempts are kept; sampling halts within ~10s.
+         * @description Stop an active shadow eval job, every key it scopes at once. Attempts are kept;
+         *     sampling halts within ~10s. Keys that already stopped on their own budget keep the
+         *     stopped_at they earned, so one write records the outcome for the whole job.
          */
         post: operations["stop_shadow_eval_job_auto_router_shadow_eval__job_id__stop_post"];
         delete?: never;
@@ -32667,18 +32670,34 @@ export interface components {
             timeout?: number | null;
         };
         /**
+         * ShadowEvalJobKeyResponse
+         * @description One key a job shadows, with its own budget and stop state.
+         */
+        ShadowEvalJobKeyResponse: {
+            /**
+             * Api Key Id
+             * @description The hashed virtual key whose traffic this row scopes
+             */
+            api_key_id: string;
+            /**
+             * Max Turns
+             * @description This key's own sample budget, independent of its siblings'
+             */
+            max_turns: number;
+            /**
+             * Stopped At
+             * @description When this key stopped sampling, whether its own budget ran out, the window closed, or an operator stopped the job. The key reads completed whenever the job does, otherwise stopped once this is set and running until then
+             */
+            stopped_at?: string | null;
+        };
+        /**
          * ShadowEvalJobResponse
          * @description A shadow-eval job. Validates directly from the prisma record (job_id reads the
-         *     row's id); status is derived from stopped_at and ends_at, never stored, so no writer
-         *     anywhere can produce an inconsistent one. Aggregate fields are populated by the
+         *     row's id); status is derived from the keys' stopped_at and ends_at, never stored, so no
+         *     writer anywhere can produce an inconsistent one. Aggregate fields are populated by the
          *     detail endpoint only and stay None on list responses.
          */
         ShadowEvalJobResponse: {
-            /**
-             * Api Key Id
-             * @description The hashed virtual key whose traffic this job evaluates, and only that key's
-             */
-            api_key_id: string;
             /**
              * Created At
              * Format: date-time
@@ -32709,12 +32728,15 @@ export interface components {
              */
             judged_count?: number | null;
             /**
+             * Keys
+             * @description The keys whose traffic this job evaluates, and only those keys', each with its own budget
+             */
+            keys: components["schemas"]["ShadowEvalJobKeyResponse"][];
+            /**
              * Last Error
              * @description Most recent attempt error; detail endpoint only
              */
             last_error?: string | null;
-            /** Max Turns */
-            max_turns: number;
             /** @description Stratified verdicts; detail endpoint only */
             results?: components["schemas"]["ShadowEvalResult"] | null;
             /** Router Name */
@@ -32723,13 +32745,12 @@ export interface components {
             shadow_percentage: number;
             /**
              * Status
-             * @description A job whose window has passed reads completed even if a later sweep stamped
-             *     stopped_at; stopped means sampling ended before the window did.
+             * @description A job whose window has passed reads completed even if a sweep stamped its keys
+             *     first; stopped means every key ended sampling before the window did. One key
+             *     exhausting its own budget leaves the job running while any sibling still samples.
              * @enum {string}
              */
             readonly status: "running" | "completed" | "stopped";
-            /** Stopped At */
-            stopped_at?: string | null;
         };
         /**
          * ShadowEvalResult
@@ -32738,6 +32759,12 @@ export interface components {
         ShadowEvalResult: {
             /** By Current Model */
             by_current_model: components["schemas"]["ShadowEvalSlice"][];
+            /**
+             * By Key
+             * @description One slice per scoped key that has judged verdicts, grouped on the raw key hash. Keys the job scopes but has not yet judged a turn for are absent rather than reported as zero
+             * @default []
+             */
+            by_key: components["schemas"]["ShadowEvalSlice"][];
             /** By Tier */
             by_tier: components["schemas"]["ShadowEvalSlice"][];
             /** Overall Shadow Win Rate Pct */
@@ -32747,8 +32774,8 @@ export interface components {
         };
         /**
          * ShadowEvalSlice
-         * @description Judge outcomes for one slice of a job's verdicts (a router tier, or one of the
-         *     models the shadowed key currently uses).
+         * @description Judge outcomes for one slice of a job's verdicts (a router tier, one of the models
+         *     the shadowed keys currently use, or one of the keys the job is scoped to).
          */
         ShadowEvalSlice: {
             /** Avg Judge Confidence */
@@ -32945,14 +32972,14 @@ export interface components {
         };
         /**
          * StartShadowEvalRequest
-         * @description Start shadowing a key's traffic through an auto-router for blind comparison.
+         * @description Start shadowing one or more keys' traffic through an auto-router for blind comparison.
          */
         StartShadowEvalRequest: {
             /**
-             * Api Key Id
-             * @description The hashed virtual key whose traffic will be shadowed. Shadow evaluation runs ONLY on this key's traffic; requests made with any other key are not sampled.
+             * Api Key Ids
+             * @description The hashed virtual keys whose traffic will be shadowed. Shadow evaluation runs ONLY on these keys' traffic; requests made with any other key are not sampled. Each key gets its own max_turns budget, so one key exhausting its budget does not end sampling for the others.
              */
-            api_key_id: string;
+            api_key_ids: string[];
             /**
              * Duration Days
              * @description How many days the job samples traffic before completing on its own
@@ -32967,7 +32994,7 @@ export interface components {
             judge_model: string;
             /**
              * Max Turns
-             * @description Sample budget: the job judges at most this many turns, then completes. This is also the spend bound; expected judge cost is roughly max_turns times one judge call
+             * @description Per-key sample budget: the job judges at most this many turns of EACH scoped key's traffic, so a job over N keys judges at most N times max_turns turns. This is also the spend bound; expected judge cost is roughly that turn ceiling times one judge call
              * @default 200
              */
             max_turns: number;
@@ -37261,7 +37288,7 @@ export interface operations {
     list_shadow_eval_jobs_auto_router_shadow_eval_get: {
         parameters: {
             query?: {
-                /** @description Filter to jobs shadowing this key */
+                /** @description Filter to jobs that shadow this key, alone or alongside others */
                 api_key_id?: string | null;
                 /** @description Newest jobs to return */
                 limit?: number;

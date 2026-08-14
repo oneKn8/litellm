@@ -525,12 +525,18 @@ GROUP BY 1
 _ATTEMPT_AGG_BY_TIER_SQL: Final = "SELECT COALESCE(tier, 'UNCLASSIFIED') AS grp," + _ATTEMPT_AGG_SELECT
 _ATTEMPT_AGG_BY_MODEL_SQL: Final = "SELECT COALESCE(real_model, 'unknown') AS grp," + _ATTEMPT_AGG_SELECT
 
-_SWEEP_FINISHED_JOBS_SQL: Final = """
-UPDATE "LiteLLM_ShadowEvalJob" j SET stopped_at = NOW()
-WHERE j.api_key_id = $1 AND j.stopped_at IS NULL
+_ATTEMPT_AGG_BY_KEY_SQL: Final = "SELECT api_key_id AS grp," + _ATTEMPT_AGG_SELECT
+
+_SWEEP_FINISHED_KEYS_SQL: Final = """
+UPDATE "LiteLLM_ShadowEvalJobKey" k SET stopped_at = NOW()
+FROM "LiteLLM_ShadowEvalJob" j
+WHERE k.job_id = j.id AND k.api_key_id = $1 AND k.stopped_at IS NULL
   AND (
     j.ends_at <= NOW()
-    OR (SELECT COUNT(*) FROM "LiteLLM_ShadowEvalAttempt" a WHERE a.job_id = j.id) >= j.max_turns
+    OR (
+      SELECT COUNT(*) FROM "LiteLLM_ShadowEvalAttempt" a
+      WHERE a.job_id = k.job_id AND a.api_key_id = k.api_key_id
+    ) >= k.max_turns
   )
 """
 
@@ -572,9 +578,10 @@ def _slices(rows: Sequence[_AttemptAggRow]) -> tuple[ShadowEvalSlice, ...]:
 
 
 async def _shadow_eval_results(prisma_client: "PrismaClient", job_id: str) -> ShadowEvalResult | None:
-    """Both stratifications of one job's verdicts. Tier answers "where does the router do
-    well"; current-model answers "which of the models this key uses today would the router
-    beat". Reads are bounded by the job's own attempts (<= max_turns) via the job_id index."""
+    """All three stratifications of one job's verdicts. Tier answers "where does the router
+    do well"; current-model answers "which of the models these keys use today would the
+    router beat"; key answers "which key's traffic does the router suit". Reads are bounded
+    by the job's own attempts (<= the sum of its keys' max_turns) via the job_id index."""
     by_tier: Final = _ATTEMPT_AGG_ROWS.validate_python(
         await prisma_client.db.query_raw(_ATTEMPT_AGG_BY_TIER_SQL, job_id) or ()
     )
@@ -583,10 +590,14 @@ async def _shadow_eval_results(prisma_client: "PrismaClient", job_id: str) -> Sh
     by_model: Final = _ATTEMPT_AGG_ROWS.validate_python(
         await prisma_client.db.query_raw(_ATTEMPT_AGG_BY_MODEL_SQL, job_id) or ()
     )
+    by_key: Final = _ATTEMPT_AGG_ROWS.validate_python(
+        await prisma_client.db.query_raw(_ATTEMPT_AGG_BY_KEY_SQL, job_id) or ()
+    )
     total_turns: Final = sum(r.turn_count for r in by_tier)
     return ShadowEvalResult(
         by_tier=_slices(by_tier),
         by_current_model=_slices(by_model),
+        by_key=_slices(by_key),
         overall_shadow_win_rate_pct=_pct_of(sum(r.shadow_wins for r in by_tier), total_turns),
         overall_tie_rate_pct=_pct_of(sum(r.ties for r in by_tier), total_turns),
     )
@@ -604,14 +615,15 @@ async def start_shadow_eval(
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
 ) -> ShadowEvalJobResponse:
     """
-    Start a pre-adoption shadow eval: duplicate a sampled slice of a key's live traffic
-    through an auto-router, judge real vs. shadow responses blind, and stratify win rates
-    by the router's tier classification and by the incumbent model.
+    Start a pre-adoption shadow eval: duplicate a sampled slice of one or more keys' live
+    traffic through an auto-router, judge real vs. shadow responses blind, and stratify win
+    rates by the router's tier classification, by the incumbent model, and by key.
 
-    Shadow responses are never served to users. The job samples until it has judged
-    max_turns turns, reaches the end of its window, or is stopped; sampling changes
-    propagate to pods within about 10 seconds. Shadow and judge calls bill to the
-    shadowed key but are excluded from request counts and auto-router adoption metrics.
+    Shadow responses are never served to users. Each key samples until it has judged
+    max_turns turns of its own traffic, the job's window ends, or the job is stopped, so a
+    busy key running out of budget does not end sampling for the others; sampling changes
+    propagate to pods within about 10 seconds. Shadow and judge calls bill to the shadowed
+    key but are excluded from request counts and auto-router adoption metrics.
     """
     from litellm.proxy.proxy_server import llm_router, prisma_client
 
@@ -621,49 +633,56 @@ async def start_shadow_eval(
     if llm_router is None or not _is_configured_pre_routing_strategy(llm_router, data.router_name):
         raise HTTPException(status_code=400, detail=f"'{data.router_name}' is not a configured auto-router")
     _validate_judge_model(llm_router, data.judge_model)
-    key_row: Final = await prisma_client.db.litellm_verificationtoken.find_unique(
-        where={"token": data.api_key_id}  # mutable-ok: Prisma filter
+    token_rows: Final = await prisma_client.db.litellm_verificationtoken.find_many(
+        where={"token": {"in": list(data.api_key_ids)}}  # mutable-ok: Prisma filter
     )
-    if key_row is None:
+    unknown: Final = tuple(sorted(frozenset(data.api_key_ids) - frozenset(row.token for row in token_rows)))
+    if unknown:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"api_key_id '{data.api_key_id}' is not a key on this proxy; pass the key's token hash, "
+                f"api_key_ids not on this proxy: {', '.join(unknown)}; pass each key's token hash, "
                 "the value the key list and key info endpoints report"
             ),
         )
 
-    # A job that expired or exhausted its turn budget stopped sampling on its own, but
-    # still holds the one-active-per-key partial unique index until stamped; free it so
-    # a new eval can start.
-    await prisma_client.db.execute_raw(_SWEEP_FINISHED_JOBS_SQL, data.api_key_id)
-    active: Final = await prisma_client.db.litellm_shadowevaljob.find_first(
-        where={"api_key_id": data.api_key_id, "stopped_at": None},  # mutable-ok: Prisma filter
+    for api_key_id in data.api_key_ids:
+        await prisma_client.db.execute_raw(_SWEEP_FINISHED_KEYS_SQL, api_key_id)
+    claimed: Final = await prisma_client.db.litellm_shadowevaljobkey.find_many(
+        where={"api_key_id": {"in": list(data.api_key_ids)}, "stopped_at": None},  # mutable-ok: Prisma filter
     )
-    if active is not None:
+    if claimed:
         raise HTTPException(
             status_code=409,
-            detail=f"Key already has an active shadow eval job ({active.id}). Stop it first.",
+            detail=(
+                "Already in an active shadow eval job: "
+                + ", ".join(sorted(f"{row.api_key_id} (job {row.job_id})" for row in claimed))
+                + ". Stop it first."
+            ),
         )
     now: Final = datetime.now(timezone.utc)
+    key_rows: Final = tuple(
+        {"api_key_id": api_key_id, "max_turns": data.max_turns}  # mutable-ok: Prisma create payload
+        for api_key_id in data.api_key_ids
+    )
     try:
         job: Final = await prisma_client.db.litellm_shadowevaljob.create(
             data={  # mutable-ok: Prisma payload
-                "api_key_id": data.api_key_id,
                 "router_name": data.router_name,
                 "judge_model": data.judge_model,
                 "shadow_percentage": data.shadow_percentage,
-                "max_turns": data.max_turns,
                 "created_by": user_api_key_dict.user_id,
                 "ends_at": now + timedelta(days=data.duration_days),
-            }
+                "keys": {"create": list(key_rows)},  # mutable-ok: Prisma nested create
+            },
+            include={"keys": True},  # mutable-ok: Prisma payload
         )
     except Exception as e:
         if not _is_unique_violation(e):
             raise
         raise HTTPException(
             status_code=409,
-            detail="Key already has an active shadow eval job (started concurrently). Stop it first.",
+            detail="A requested key was claimed by another shadow eval job concurrently. Stop it first.",
         ) from e
     return ShadowEvalJobResponse.model_validate(job, from_attributes=True)
 
@@ -676,7 +695,9 @@ async def start_shadow_eval(
 )
 async def list_shadow_eval_jobs(
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
-    api_key_id: Annotated[str | None, Query(description="Filter to jobs shadowing this key")] = None,
+    api_key_id: Annotated[
+        str | None, Query(description="Filter to jobs that shadow this key, alone or alongside others")
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=200, description="Newest jobs to return")] = 50,
 ) -> tuple[ShadowEvalJobResponse, ...]:
     """List shadow eval jobs, newest first. Counts and results ride the detail endpoint only."""
@@ -686,7 +707,8 @@ async def list_shadow_eval_jobs(
     if prisma_client is None:
         raise HTTPException(status_code=500, detail=CommonProxyErrors.db_not_connected_error.value)
     records: Final = await prisma_client.db.litellm_shadowevaljob.find_many(
-        where={"api_key_id": api_key_id} if api_key_id else {},  # mutable-ok: Prisma filter
+        where={"keys": {"some": {"api_key_id": api_key_id}}} if api_key_id else {},  # mutable-ok: Prisma filter
+        include={"keys": True},  # mutable-ok: Prisma payload
         order={"created_at": "desc"},  # mutable-ok: Prisma order
         take=limit,
     )
@@ -710,7 +732,8 @@ async def get_shadow_eval_job(
     if prisma_client is None:
         raise HTTPException(status_code=500, detail=CommonProxyErrors.db_not_connected_error.value)
     record: Final = await prisma_client.db.litellm_shadowevaljob.find_unique(
-        where={"id": job_id}  # mutable-ok: Prisma filter
+        where={"id": job_id},  # mutable-ok: Prisma filter
+        include={"keys": True},  # mutable-ok: Prisma payload
     )
     if record is None:
         raise HTTPException(status_code=404, detail=f"No shadow eval job {job_id}")
@@ -742,22 +765,31 @@ async def stop_shadow_eval_job(
     job_id: str,
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
 ) -> ShadowEvalJobResponse:
-    """Stop an active shadow eval job. Attempts are kept; sampling halts within ~10s."""
+    """Stop an active shadow eval job, every key it scopes at once. Attempts are kept;
+    sampling halts within ~10s. Keys that already stopped on their own budget keep the
+    stopped_at they earned, so one write records the outcome for the whole job."""
     from litellm.proxy.proxy_server import prisma_client
 
     _require_admin_writer(user_api_key_dict, "stop a shadow eval")
     if prisma_client is None:
         raise HTTPException(status_code=500, detail=CommonProxyErrors.db_not_connected_error.value)
     record: Final = await prisma_client.db.litellm_shadowevaljob.find_unique(
-        where={"id": job_id}  # mutable-ok: Prisma filter
+        where={"id": job_id},  # mutable-ok: Prisma filter
+        include={"keys": True},  # mutable-ok: Prisma payload
     )
     if record is None:
         raise HTTPException(status_code=404, detail=f"No shadow eval job {job_id}")
     current: Final = ShadowEvalJobResponse.model_validate(record, from_attributes=True)
     if current.status != "running":
         raise HTTPException(status_code=400, detail=f"Job {job_id} is already {current.status}")
-    updated: Final = await prisma_client.db.litellm_shadowevaljob.update(
-        where={"id": job_id},  # mutable-ok: Prisma filter
+    await prisma_client.db.litellm_shadowevaljobkey.update_many(
+        where={"job_id": job_id, "stopped_at": None},  # mutable-ok: Prisma filter
         data={"stopped_at": datetime.now(timezone.utc)},  # mutable-ok: Prisma payload
     )
+    updated: Final = await prisma_client.db.litellm_shadowevaljob.find_unique(
+        where={"id": job_id},  # mutable-ok: Prisma filter
+        include={"keys": True},  # mutable-ok: Prisma payload
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"No shadow eval job {job_id}")
     return ShadowEvalJobResponse.model_validate(updated, from_attributes=True)

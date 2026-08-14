@@ -25,6 +25,7 @@ from litellm.types.utils import SHADOW_EVAL_JUDGE_CALL_ORIGIN, SHADOW_EVAL_ROUTE
 def _job(**overrides) -> ActiveShadowEvalJob:
     defaults = dict(
         id="job-1",
+        api_key_id="key-hash",
         router_name="my-router",
         shadow_percentage=100.0,
         judge_model="judge-model",
@@ -35,28 +36,32 @@ def _job(**overrides) -> ActiveShadowEvalJob:
     return ActiveShadowEvalJob(**{**defaults, **overrides})
 
 
-def _prisma(jobs=(), attempt_counts=()) -> MagicMock:
+def _prisma(keys=(), attempt_counts=()) -> MagicMock:
     prisma = MagicMock()
-    prisma.db.litellm_shadowevaljob.find_many = AsyncMock(return_value=list(jobs))
+    prisma.db.litellm_shadowevaljobkey.find_many = AsyncMock(return_value=list(keys))
     prisma.db.litellm_shadowevalattempt.group_by = AsyncMock(
-        return_value=[{"job_id": job_id, "_count": {"_all": count}} for job_id, count in attempt_counts]
+        return_value=[
+            {"job_id": job_id, "api_key_id": api_key_id, "_count": {"_all": count}}
+            for job_id, api_key_id, count in attempt_counts
+        ]
     )
     prisma.db.litellm_shadowevalattempt.create = AsyncMock()
     return prisma
 
 
-def _job_record(job: ActiveShadowEvalJob, api_key_id="key-hash") -> MagicMock:
+def _key_record(job: ActiveShadowEvalJob) -> MagicMock:
+    """One LiteLLM_ShadowEvalJobKey row with its job relation loaded, as `include={"job": True}`
+    hands it back: per-key budget on the row, shared config on the relation."""
     record = MagicMock()
+    for field, value in dict(job_id=job.id, api_key_id=job.api_key_id, max_turns=job.max_turns).items():
+        setattr(record, field, value)
     for field, value in dict(
-        id=job.id,
-        api_key_id=api_key_id,
         router_name=job.router_name,
         shadow_percentage=job.shadow_percentage,
         judge_model=job.judge_model,
-        max_turns=job.max_turns,
         ends_at=job.ends_at,
     ).items():
-        setattr(record, field, value)
+        setattr(record.job, field, value)
     return record
 
 
@@ -77,15 +82,16 @@ def _router(shadow_text="shadow answer", judge_json='{"preference": "A", "confid
     return router
 
 
-def _logger(router=None, prisma=None, job=None) -> ShadowEvalLogger:
+def _logger(router=None, prisma=None, job=None, jobs=None) -> ShadowEvalLogger:
     cache = InMemoryCache(max_size_in_memory=4, default_ttl=60)
     logger = ShadowEvalLogger(
         router_provider=lambda: router,
         prisma_provider=lambda: prisma,
         jobs_cache=cache,
     )
-    if job is not None:
-        cache.set_cache("shadow_eval:active_jobs", {"key-hash": job})
+    entries = jobs if jobs is not None else ({job.api_key_id: job} if job is not None else None)
+    if entries is not None:
+        cache.set_cache("shadow_eval:active_jobs", entries)
     return logger
 
 
@@ -173,6 +179,7 @@ class TestSuccessHookSkipChain:
         create.assert_awaited_once()
         row = create.call_args.kwargs["data"]
         assert row["job_id"] == "job-1"
+        assert row["api_key_id"] == "key-hash"
         assert row["request_id"] == "req-1"
         assert row["outcome"] in ("real", "shadow")
         assert row["tier"] == "SIMPLE"
@@ -181,7 +188,7 @@ class TestSuccessHookSkipChain:
         assert row["confidence"] == 0.9
         assert row["judge_cost"] == 0.005
         assert row["error"] is None
-        assert prisma.db.litellm_shadowevaljob.find_many.await_count == 0
+        assert prisma.db.litellm_shadowevaljobkey.find_many.await_count == 0
 
     @pytest.mark.parametrize(
         "kwargs_mutation,job_mutation",
@@ -210,13 +217,13 @@ class TestSuccessHookSkipChain:
         starts = job_mutation.pop("_starts", 0)
         prisma = _prisma()
         logger = _logger(router=_router(), prisma=prisma, job=_job(**job_mutation))
-        logger._job_starts = {"job-1": starts}
+        logger._job_starts = {"key-hash": starts}
 
         await logger.async_log_success_event(_success_kwargs(**kwargs_mutation), RESPONSE, None, None)
         await _drain(logger)
 
         prisma.db.litellm_shadowevalattempt.create.assert_not_called()
-        assert logger._job_starts.get("job-1", 0) == starts
+        assert logger._job_starts.get("key-hash", 0) == starts
 
     async def test_completed_pipelines_hold_turn_budget_within_a_cache_generation(self):
         """A finished pipeline frees its concurrency slot but not its slice of the turn
@@ -230,6 +237,50 @@ class TestSuccessHookSkipChain:
         await _drain(logger)
 
         assert prisma.db.litellm_shadowevalattempt.create.await_count == 1
+
+    async def test_one_keys_exhausted_budget_leaves_its_siblings_sampling(self):
+        """The turn budget belongs to the key, not to the job, so a job scoping two keys
+        keeps shadowing the second after the first has spent its own max_turns."""
+        prisma = _prisma()
+        logger = _logger(
+            router=_router(),
+            prisma=prisma,
+            jobs={
+                "spent-key": _job(api_key_id="spent-key", attempts=200, max_turns=200),
+                "fresh-key": _job(api_key_id="fresh-key", attempts=0, max_turns=200),
+            },
+        )
+
+        await logger.async_log_success_event(_success_kwargs(api_key_hash="spent-key"), RESPONSE, None, None)
+        await _drain(logger)
+        await logger.async_log_success_event(_success_kwargs(api_key_hash="fresh-key"), RESPONSE, None, None)
+        await _drain(logger)
+
+        create = prisma.db.litellm_shadowevalattempt.create
+        create.assert_awaited_once()
+        assert create.call_args.kwargs["data"]["api_key_id"] == "fresh-key"
+
+    async def test_started_turns_are_held_against_the_starting_key_only(self):
+        """The in-generation starts counter is keyed by key too. Spending the sibling's
+        last turn must not close the budget of a key that has one left."""
+        prisma = _prisma()
+        logger = _logger(
+            router=_router(),
+            prisma=prisma,
+            jobs={
+                "key-a": _job(api_key_id="key-a", attempts=199, max_turns=200),
+                "key-b": _job(api_key_id="key-b", attempts=199, max_turns=200),
+            },
+        )
+
+        for api_key_hash in ("key-a", "key-a", "key-b"):
+            await logger.async_log_success_event(
+                _success_kwargs(request_id=f"req-{api_key_hash}", api_key_hash=api_key_hash), RESPONSE, None, None
+            )
+            await _drain(logger)
+
+        attributed = [call.kwargs["data"]["api_key_id"] for call in prisma.db.litellm_shadowevalattempt.create.call_args_list]
+        assert attributed == ["key-a", "key-b"]
 
     async def test_v1_messages_surface_forwards_identity_from_litellm_metadata(self):
         """/v1/messages stores identity in litellm_params.litellm_metadata, so the hook
@@ -281,7 +332,7 @@ class TestSuccessHookSkipChain:
 class TestActiveJobsCache:
     async def test_cache_miss_reads_db_once_then_serves_from_cache(self):
         job = _job()
-        prisma = _prisma(jobs=[_job_record(job)], attempt_counts=[("job-1", 7)])
+        prisma = _prisma(keys=[_key_record(job)], attempt_counts=[("job-1", "key-hash", 7)])
         logger = ShadowEvalLogger(
             router_provider=lambda: None,
             prisma_provider=lambda: prisma,
@@ -293,15 +344,38 @@ class TestActiveJobsCache:
 
         assert first["key-hash"].id == "job-1"
         assert second["key-hash"].attempts == 7
-        assert prisma.db.litellm_shadowevaljob.find_many.await_count == 1
-        where = prisma.db.litellm_shadowevaljob.find_many.call_args.kwargs["where"]
+        assert prisma.db.litellm_shadowevaljobkey.find_many.await_count == 1
+        where = prisma.db.litellm_shadowevaljobkey.find_many.call_args.kwargs["where"]
         assert where["stopped_at"] is None
-        assert "gt" in where["ends_at"]
+        assert "gt" in where["job"]["is"]["ends_at"]
         count_where = prisma.db.litellm_shadowevalattempt.group_by.call_args.kwargs["where"]
         assert count_where == {"job_id": {"in": ["job-1"]}}
 
+    async def test_one_job_fills_one_entry_per_key_with_that_keys_own_count(self):
+        """Two keys of one job carry independent budgets, so the fill must group attempts
+        by key as well as by job. Grouping by job alone hands both keys the same count."""
+        spent = _job(api_key_id="spent-key", max_turns=200)
+        fresh = _job(api_key_id="fresh-key", max_turns=50)
+        prisma = _prisma(
+            keys=[_key_record(spent), _key_record(fresh)],
+            attempt_counts=[("job-1", "spent-key", 200), ("job-1", "fresh-key", 3)],
+        )
+        logger = ShadowEvalLogger(
+            router_provider=lambda: None,
+            prisma_provider=lambda: prisma,
+            jobs_cache=InMemoryCache(max_size_in_memory=4, default_ttl=60),
+        )
+
+        jobs = await logger._active_jobs()
+
+        assert set(jobs) == {"spent-key", "fresh-key"}
+        assert jobs["spent-key"].attempts == 200 and jobs["spent-key"].max_turns == 200
+        assert jobs["fresh-key"].attempts == 3 and jobs["fresh-key"].max_turns == 50
+        assert jobs["fresh-key"].id == "job-1"
+        assert prisma.db.litellm_shadowevalattempt.group_by.call_args.kwargs["by"] == ["job_id", "api_key_id"]
+
     async def test_no_active_jobs_is_cached_too(self):
-        prisma = _prisma(jobs=[])
+        prisma = _prisma(keys=[])
         logger = ShadowEvalLogger(
             router_provider=lambda: None,
             prisma_provider=lambda: prisma,
@@ -310,12 +384,12 @@ class TestActiveJobsCache:
 
         assert await logger._active_jobs() == {}
         assert await logger._active_jobs() == {}
-        assert prisma.db.litellm_shadowevaljob.find_many.await_count == 1
+        assert prisma.db.litellm_shadowevaljobkey.find_many.await_count == 1
         prisma.db.litellm_shadowevalattempt.group_by.assert_not_called()
 
     async def test_db_fault_returns_empty_without_caching_the_fault(self):
         prisma = _prisma()
-        prisma.db.litellm_shadowevaljob.find_many = AsyncMock(side_effect=RuntimeError("db blip"))
+        prisma.db.litellm_shadowevaljobkey.find_many = AsyncMock(side_effect=RuntimeError("db blip"))
         logger = ShadowEvalLogger(
             router_provider=lambda: None,
             prisma_provider=lambda: prisma,
@@ -324,17 +398,17 @@ class TestActiveJobsCache:
 
         assert await logger._active_jobs() == {}
         assert await logger._active_jobs() == {}
-        assert prisma.db.litellm_shadowevaljob.find_many.await_count == 2
+        assert prisma.db.litellm_shadowevaljobkey.find_many.await_count == 2
 
     async def test_cache_refill_resets_the_starts_counter(self):
         job = _job()
-        prisma = _prisma(jobs=[_job_record(job)], attempt_counts=[("job-1", 7)])
+        prisma = _prisma(keys=[_key_record(job)], attempt_counts=[("job-1", "key-hash", 7)])
         logger = ShadowEvalLogger(
             router_provider=lambda: None,
             prisma_provider=lambda: prisma,
             jobs_cache=InMemoryCache(max_size_in_memory=4, default_ttl=60),
         )
-        logger._job_starts = {"job-1": 5}
+        logger._job_starts = {"key-hash": 5}
 
         await logger._active_jobs()
 

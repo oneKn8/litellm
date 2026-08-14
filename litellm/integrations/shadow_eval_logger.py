@@ -2,7 +2,9 @@
 through the auto-router in a detached task, blind-judges real vs shadow, and appends one
 ``LiteLLM_ShadowEvalAttempt`` row (verdict or error) as the feature's only hot-path write.
 Counts, status, and spend derive from those rows at read time, so nothing can disagree
-across pods or stop races; the hook reads active jobs through a short-TTL cache."""
+across pods or stop races; the hook reads active keys through a short-TTL cache. A job can
+scope several keys, and each carries its own turn budget and stop state, so the unit this
+module samples and budgets against is the key, not the job."""
 
 import asyncio
 import hashlib
@@ -199,10 +201,13 @@ class _JudgeVerdict:
 
 @dataclass(frozen=True, slots=True)
 class ActiveShadowEvalJob:
-    """One active job as the sampling path needs it: immutable config plus the attempt
-    count as of the cache fill (the turn budget's staleness is bounded by the cache TTL)."""
+    """One key's active sampling as the path needs it: immutable job config plus that key's
+    own budget and attempt count as of the cache fill (the budget's staleness is bounded by
+    the cache TTL). A job over N keys yields N of these, one per key, with independent
+    budgets, so exhausting one leaves its siblings sampling."""
 
     id: str
+    api_key_id: str
     router_name: str
     shadow_percentage: float
     judge_model: str
@@ -234,13 +239,16 @@ class ShadowEvalLogger(CustomLogger):
         self._prisma_provider = prisma_provider or _default_prisma_provider
         self._jobs_cache = jobs_cache or _jobs_cache
         self._inflight_shadow_tasks: int = 0
-        # Starts per job since the last cache fill, never decremented within a
-        # generation; the refill absorbs written rows and resets.
+        # Starts per shadowed key since the last cache fill, never decremented within a
+        # generation; the refill absorbs written rows and resets. Keyed by key rather than
+        # by job because the turn budget it guards is per key.
         self._job_starts: dict[str, int] = {}  # mutable-ok: per-generation counter
 
     async def _active_jobs(self) -> Mapping[str, ActiveShadowEvalJob]:
-        """Active jobs by api_key_id, cache-first. A DB fault returns empty without
-        caching, so sampling pauses for that request and the next one retries."""
+        """Sampling keys by api_key_id, cache-first. A DB fault returns empty without
+        caching, so sampling pauses for that request and the next one retries. A key row is
+        unstopped for at most one job at a time (partial unique index), so keying the
+        mapping on api_key_id cannot collide."""
         cached: Final = await self._jobs_cache.async_get_cache(_JOBS_CACHE_KEY)
         if cached is not None:
             return cached  # pyright: ignore[reportReturnType]  # cache stores exactly this mapping shape
@@ -248,34 +256,41 @@ class ShadowEvalLogger(CustomLogger):
         if prisma is None:
             return _EMPTY_JOBS
         try:
-            records: Final = await prisma.db.litellm_shadowevaljob.find_many(
+            records: Final = await prisma.db.litellm_shadowevaljobkey.find_many(
                 where={  # mutable-ok: Prisma filter
                     "stopped_at": None,
-                    "ends_at": {"gt": datetime.now(timezone.utc)},  # mutable-ok: Prisma filter
+                    "job": {"is": {"ends_at": {"gt": datetime.now(timezone.utc)}}},  # mutable-ok: Prisma filter
                 },
+                include={"job": True},  # mutable-ok: Prisma payload
             )
             grouped: Final = (
                 await prisma.db.litellm_shadowevalattempt.group_by(
-                    by=["job_id"],
+                    by=["job_id", "api_key_id"],
                     count=True,
-                    where={"job_id": {"in": [str(record.id) for record in records]}},  # mutable-ok: Prisma filter
+                    where={"job_id": {"in": [str(r.job_id) for r in records]}},  # mutable-ok: Prisma filter
                 )
                 if records
                 else ()
             )
-            attempt_counts: Final = {str(row["job_id"]): int(row["_count"]["_all"]) for row in grouped or []}
-            jobs: Final = {
-                str(record.api_key_id): ActiveShadowEvalJob(
-                    id=str(record.id),
-                    router_name=str(record.router_name),
-                    shadow_percentage=float(record.shadow_percentage),
-                    judge_model=str(record.judge_model),
-                    max_turns=int(record.max_turns),
-                    ends_at=_as_utc(record.ends_at),
-                    attempts=attempt_counts.get(str(record.id), 0),
-                )
-                for record in records or []
-            }
+            attempt_counts: Final = MappingProxyType(
+                {(str(row["job_id"]), str(row["api_key_id"])): int(row["_count"]["_all"]) for row in grouped or ()}
+            )
+            jobs: Final = MappingProxyType(
+                {
+                    str(record.api_key_id): ActiveShadowEvalJob(
+                        id=str(record.job_id),
+                        api_key_id=str(record.api_key_id),
+                        router_name=str(job.router_name),
+                        shadow_percentage=float(job.shadow_percentage),
+                        judge_model=str(job.judge_model),
+                        max_turns=int(record.max_turns),
+                        ends_at=_as_utc(job.ends_at),
+                        attempts=attempt_counts.get((str(record.job_id), str(record.api_key_id)), 0),
+                    )
+                    for record in records or ()
+                    if (job := record.job) is not None
+                }
+            )
             await self._jobs_cache.async_set_cache(_JOBS_CACHE_KEY, jobs)
             self._job_starts = {}  # rebind-ok: new generation, counts absorbed into the fill
             return jobs
@@ -313,7 +328,7 @@ class ShadowEvalLogger(CustomLogger):
                 return
             if datetime.now(timezone.utc) >= job.ends_at:
                 return
-            if job.attempts + self._job_starts.get(job.id, 0) >= job.max_turns:
+            if job.attempts + self._job_starts.get(job.api_key_id, 0) >= job.max_turns:
                 return
             request_id: Final = payload.get("id") or ""
             if not request_id:
@@ -327,7 +342,7 @@ class ShadowEvalLogger(CustomLogger):
             if self._inflight_shadow_tasks >= _MAX_CONCURRENT_SHADOW_TASKS:
                 return
             raw_messages: Final = kwargs.get("messages")
-            self._job_starts[job.id] = self._job_starts.get(job.id, 0) + 1
+            self._job_starts[job.api_key_id] = self._job_starts.get(job.api_key_id, 0) + 1
             self._inflight_shadow_tasks += 1
             task: Final = asyncio.create_task(
                 self._run_shadow_eval(
@@ -432,6 +447,7 @@ class ShadowEvalLogger(CustomLogger):
             await prisma.db.litellm_shadowevalattempt.create(
                 data={  # mutable-ok: Prisma payload
                     "job_id": job.id,
+                    "api_key_id": job.api_key_id,
                     "request_id": request_id,
                     "outcome": outcome,
                     "tier": shadow.tier if shadow else None,

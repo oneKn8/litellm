@@ -6,7 +6,7 @@ import { useInfiniteKeys } from "@/app/(dashboard)/hooks/keys/useKeys";
 import useAuthorized from "@/app/(dashboard)/hooks/useAuthorized";
 import { useModelCostMap } from "@/app/(dashboard)/hooks/models/useModelCostMap";
 import { useAutoRouters } from "@/app/(dashboard)/hooks/models/useModels";
-import { PaginatedSearchSelect } from "@/components/shared/PaginatedSearchSelect";
+import { PaginatedMultiSelect } from "@/components/shared/PaginatedMultiSelect";
 import { SearchSelect, type SearchSelectOption } from "@/components/shared/SearchSelect";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -24,7 +24,9 @@ import {
   useStartShadowEval,
   useStopShadowEval,
   type ShadowEvalJob,
+  type ShadowEvalJobKey,
   type ShadowEvalSlice,
+  type StartShadowEvalRequest,
 } from "./useShadowEval";
 
 const pct = (value: number): string => `${value.toFixed(1)}%`;
@@ -117,6 +119,64 @@ const VerdictBar: React.FC<{ results: NonNullable<ShadowEvalJob["results"]> }> =
   );
 };
 
+const totalBudget = (job: ShadowEvalJob): number => job.keys.reduce((sum, key) => sum + key.max_turns, 0);
+
+const keyStatus = (job: ShadowEvalJob, key: ShadowEvalJobKey): string => {
+  if (job.status === "completed") return "completed";
+  return key.stopped_at ? "stopped" : "running";
+};
+
+const KeyTable: React.FC<{ job: ShadowEvalJob }> = ({ job }) => {
+  const slices = new Map((job.results?.by_key ?? []).map((slice) => [slice.group, slice]));
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Key</TableHead>
+          <TableHead>Status</TableHead>
+          {["Judged of budget", "Router wins", "Current model wins", "Ties", "Judge confidence"].map((label) => (
+            <TableHead key={label} className="text-right">
+              {label}
+            </TableHead>
+          ))}
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {job.keys.map((key) => {
+          const slice = slices.get(key.api_key_id);
+          return (
+            <TableRow key={key.api_key_id}>
+              <TableCell className="max-w-[16rem] truncate font-mono text-xs" title={key.api_key_id}>
+                {key.api_key_id}
+              </TableCell>
+              <TableCell>
+                <StatusBadge status={keyStatus(job, key)} />
+              </TableCell>
+              <TableCell className="text-right tabular-nums">
+                {(slice?.turn_count ?? 0).toLocaleString()} / {key.max_turns.toLocaleString()}
+              </TableCell>
+              {slice ? (
+                <>
+                  <TableCell className="text-right font-medium tabular-nums text-foreground">
+                    {pct(slice.shadow_win_rate_pct)}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">{pct(slice.real_win_rate_pct)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{pct(slice.tie_rate_pct)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{slice.avg_judge_confidence.toFixed(2)}</TableCell>
+                </>
+              ) : (
+                <TableCell colSpan={4} className="text-right text-xs text-muted-foreground">
+                  No verdicts yet
+                </TableCell>
+              )}
+            </TableRow>
+          );
+        })}
+      </TableBody>
+    </Table>
+  );
+};
+
 const emptyResultsText = (job: ShadowEvalJob, resultsError: boolean): string => {
   if (resultsError) return "Results could not be loaded. Retrying.";
   if (isActive(job)) return "Collecting verdicts. Results appear as sampled requests are judged.";
@@ -172,7 +232,7 @@ const JobResults: React.FC<{
               Shadowing {job.shadow_percentage}% via <span className="font-mono text-xs">{job.router_name}</span>
             </p>
             <p className="text-xs text-muted-foreground">
-              {(job.judged_count ?? 0).toLocaleString()} of {job.max_turns.toLocaleString()} turns judged ·{" "}
+              {(job.judged_count ?? 0).toLocaleString()} of {totalBudget(job).toLocaleString()} turns judged ·{" "}
               {(job.error_count ?? 0).toLocaleString()} errored · {usd(job.judge_spend ?? 0)} judge spend
               {active && remaining ? ` · ${remaining}` : ""}
             </p>
@@ -190,6 +250,9 @@ const JobResults: React.FC<{
         </p>
       )}
       <ResultsBody job={job} resultsError={resultsError} />
+      <div className="border-t">
+        <KeyTable job={job} />
+      </div>
     </Card>
   );
 };
@@ -244,7 +307,7 @@ const Field: React.FC<{ label: string; htmlFor?: string; className?: string; chi
   </div>
 );
 
-const KeySelect: React.FC<{ value: string; onChange: (token: string) => void }> = ({ value, onChange }) => {
+const KeySelect: React.FC<{ value: string[]; onChange: (tokens: string[]) => void }> = ({ value, onChange }) => {
   const [search, setSearch] = useState("");
   const { data, isPending, isError, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteKeys(50, {
     selectedKeyAlias: search || null,
@@ -261,7 +324,7 @@ const KeySelect: React.FC<{ value: string; onChange: (token: string) => void }> 
     [data],
   );
   return (
-    <PaginatedSearchSelect
+    <PaginatedMultiSelect
       inputId="shadow-eval-key"
       options={options}
       value={value}
@@ -280,7 +343,7 @@ const KeySelect: React.FC<{ value: string; onChange: (token: string) => void }> 
 
 const StartForm: React.FC = () => {
   const { accessToken } = useAuthorized();
-  const [apiKeyId, setApiKeyId] = useState("");
+  const [apiKeyIds, setApiKeyIds] = useState<string[]>([]);
   const [routerName, setRouterName] = useState("");
   const [percentage, setPercentage] = useState("10");
   const [durationDays, setDurationDays] = useState("7");
@@ -301,12 +364,12 @@ const StartForm: React.FC = () => {
   const percentageValid = parsedPct >= 0.1 && parsedPct <= 100;
   const parsedMaxTurns = Number.parseInt(maxTurns, 10);
   const maxTurnsValid = parsedMaxTurns >= 1 && parsedMaxTurns <= 2000;
-  const filled = [apiKeyId, routerName, judgeModel].every((field) => field !== "");
+  const filled = apiKeyIds.length > 0 && [routerName, judgeModel].every((field) => field !== "");
   const boundsValid = percentageValid && maxTurnsValid;
   const valid = Boolean(accessToken) && filled && boundsValid;
   const handleStart = () => {
-    const startBody = {
-      api_key_id: apiKeyId,
+    const startBody: StartShadowEvalRequest = {
+      api_key_ids: apiKeyIds,
       router_name: routerName,
       shadow_percentage: parsedPct,
       duration_days: Number.parseInt(durationDays, 10),
@@ -321,14 +384,15 @@ const StartForm: React.FC = () => {
       <CardHeader>
         <CardTitle className="text-sm font-medium text-foreground">Start a shadow eval</CardTitle>
         <p className="text-xs text-muted-foreground">
-          Duplicates a sampled slice of the key&apos;s traffic through the auto-router and has an LLM judge compare both
-          answers blind. The router&apos;s answers are never served to users; judge calls bill to the shadowed key.
+          Duplicates a sampled slice of each selected key&apos;s traffic through the auto-router and has an LLM judge
+          compare both answers blind. The router&apos;s answers are never served to users; judge calls bill to the key
+          whose traffic was sampled.
         </p>
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="grid gap-3 sm:grid-cols-3">
-          <Field label="Key to shadow" htmlFor="shadow-eval-key">
-            <KeySelect value={apiKeyId} onChange={setApiKeyId} />
+          <Field label="Keys to shadow" htmlFor="shadow-eval-key">
+            <KeySelect value={apiKeyIds} onChange={setApiKeyIds} />
           </Field>
           <Field label="Auto-router">
             <SearchSelect
@@ -383,7 +447,7 @@ const StartForm: React.FC = () => {
                 value={maxTurns}
                 onChange={(e) => setMaxTurns(e.target.value)}
               />
-              <span className="text-sm text-muted-foreground">turns judged, max</span>
+              <span className="text-sm text-muted-foreground">turns judged per key, max</span>
             </div>
             {maxTurns.trim() !== "" && !maxTurnsValid && (
               <p className="text-xs text-destructive">Enter a value from 1 to 2000</p>
