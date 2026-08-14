@@ -2599,18 +2599,18 @@ class MCPServerManager:
 
             if len(combined_servers) == 0:
                 verbose_logger.debug("No allowed MCP Servers found for user api key auth.")
-            scope = MCPServerManager._admitted_session_resource_scope(user_api_key_auth)
+            scope: Final = MCPServerManager._admitted_session_resource_scope(user_api_key_auth)
             return [server_id for server_id in combined_servers if scope is None or server_id == scope]
         except Exception:  # noqa: BLE001
             verbose_logger.exception(
                 "Failed to get allowed MCP servers; team-level object_permission "
                 "grants may be dropped. Falling back to global and submitted servers."
             )
-            scope = MCPServerManager._admitted_session_resource_scope(user_api_key_auth)
+            fallback_scope: Final = MCPServerManager._admitted_session_resource_scope(user_api_key_auth)
             return [
                 server_id
                 for server_id in dict.fromkeys(allow_all_server_ids + submitted_server_ids)
-                if scope is None or server_id == scope
+                if fallback_scope is None or server_id == fallback_scope
             ]
 
     async def resolve_toolset_tool_permissions(

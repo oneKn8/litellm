@@ -56,7 +56,7 @@ from litellm._logging import verbose_logger
 from litellm.caching.caching import DualCache
 from litellm.proxy._experimental.mcp_server.oauth_utils import (
     TOKEN_NO_CACHE_HEADERS,
-    _canonical_resource_uri,
+    canonical_resource_uri,
     canonicalize_url_identity,
     get_request_base_url,
     is_loopback_redirect_host,
@@ -337,7 +337,7 @@ def resolve_scoped_resource_server(request: Request, resource: str | None) -> MC
     NARROWS the session via the sealed scope."""
     if resource is None:
         return None
-    canonical = _canonical_resource_uri(resource)
+    canonical = canonical_resource_uri(resource)
     if canonical is None:
         return None
     base = canonicalize_url_identity(get_request_base_url(request))
@@ -350,7 +350,9 @@ def resolve_scoped_resource_server(request: Request, resource: str | None) -> MC
         global_mcp_server_manager,
     )
 
-    names = MCPRequestHandler._extract_target_server_names_from_path(canonical[len(base) :])
+    names = MCPRequestHandler._extract_target_server_names_from_path(  # pyright: ignore[reportPrivateUsage]  # the one MCP path parser; a second copy here could disagree with admission
+        canonical[len(base) :]
+    )
     if len(names) != 1:
         return None
     server = global_mcp_server_manager.get_mcp_server_by_name(

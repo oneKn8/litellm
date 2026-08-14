@@ -600,7 +600,7 @@ LOOPBACK_REDIRECT_URI = "http://localhost:3118/callback"
 async def _complete(redirect_uri: str, delivery, cookies=None, handle=None, session_user_id="u1"):
     client_id = (await _register([redirect_uri]))["client_id"]
     if cookies is None:
-        handle, cookies = _flow_cookie_from(_authorize(client_id, session_user_id="u1", redirect_uri=redirect_uri))
+        handle, cookies = _flow_cookie_from(await _authorize(client_id, session_user_id="u1", redirect_uri=redirect_uri))
     response = await complete_connect_flow(
         request=_request("/authorize/complete", cookies=cookies, method="POST"),
         flow_handle=handle,
@@ -706,7 +706,7 @@ async def test_unknown_delivery_value_is_rejected_before_the_flow_is_consumed():
     """A typo'd delivery must not burn the single-use flow: the user fixes the form and
     finishes normally."""
     client_id = (await _register([LOOPBACK_REDIRECT_URI]))["client_id"]
-    handle, cookies = _flow_cookie_from(_authorize(client_id, session_user_id="u1", redirect_uri=LOOPBACK_REDIRECT_URI))
+    handle, cookies = _flow_cookie_from(await _authorize(client_id, session_user_id="u1", redirect_uri=LOOPBACK_REDIRECT_URI))
 
     rejected = await complete_connect_flow(
         request=_request("/authorize/complete", cookies=cookies, method="POST"),
@@ -914,7 +914,7 @@ async def test_scoped_authorize_interactive_unvaulted_runs_connect_page_with_sea
         manager.has_user_oauth_token = AsyncMock(return_value=False)
         response = await _scoped_authorize(client_id, SCOPED_RESOURCE)
     assert response.status_code == 303
-    assert "/ui/chat/integrations" in response.headers["location"]
+    assert "/ui/connect" in response.headers["location"]
     handle, cookies = _flow_cookie_from(response)
     completed = await complete_connect_flow(
         request=_request("/authorize/complete", cookies=cookies, method="POST"),
@@ -953,7 +953,7 @@ async def test_unscoped_resources_leave_flow_and_token_byte_identical(resource, 
         manager.get_mcp_server_by_name.return_value = None if resolves is None else _scoped_mcp_server()
         response = await _scoped_authorize(client_id, resource)
     assert response.status_code == 303
-    assert "/ui/chat/integrations" in response.headers["location"]
+    assert "/ui/connect" in response.headers["location"]
     handle, cookies = _flow_cookie_from(response)
     completed = await complete_connect_flow(
         request=_request("/authorize/complete", cookies=cookies, method="POST"),
@@ -981,7 +981,7 @@ async def test_scoped_authorize_delegate_server_stays_unscoped():
     with patch(_MANAGER_PATCH) as manager:
         manager.get_mcp_server_by_name.return_value = _scoped_mcp_server(delegate_auth_to_upstream=True)
         response = await _scoped_authorize(client_id, SCOPED_RESOURCE)
-    assert "/ui/chat/integrations" in response.headers["location"]
+    assert "/ui/connect" in response.headers["location"]
 
 
 @pytest.mark.asyncio

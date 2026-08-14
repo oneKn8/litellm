@@ -9808,18 +9808,32 @@ class TestSessionResourceScopeIntersect:
         auth.mcp_session_resource_server_id = scope
         return auth
 
-    def test_scope_reader_is_none_for_keys_and_unscoped_subjects(self):
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unscoped_auth", ["key", "subject_without_scope"])
+    async def test_a_caller_without_a_sealed_scope_is_never_narrowed(self, unscoped_auth):
+        """Only an admitted session subject carrying a sealed resource narrows the set: a plain
+        virtual key and an unscoped subject still reach everything they are granted plus the
+        operator-open servers."""
+        from unittest.mock import AsyncMock, patch
+
         from litellm.proxy._experimental.mcp_server.mcp_server_manager import MCPServerManager
         from litellm.proxy._types import UserAPIKeyAuth
 
-        assert MCPServerManager._admitted_session_resource_scope(None) is None
-        assert MCPServerManager._admitted_session_resource_scope(UserAPIKeyAuth(user_id="u")) is None
-        assert MCPServerManager._admitted_session_resource_scope(self._admitted_auth(None)) is None
-
-    def test_scope_reader_returns_sealed_scope_for_admitted_subjects(self):
-        from litellm.proxy._experimental.mcp_server.mcp_server_manager import MCPServerManager
-
-        assert MCPServerManager._admitted_session_resource_scope(self._admitted_auth("b")) == "b"
+        manager = MCPServerManager()
+        auth = UserAPIKeyAuth(user_id="u") if unscoped_auth == "key" else self._admitted_auth(None)
+        with (
+            patch.object(MCPServerManager, "get_allow_all_keys_server_ids", return_value=["open-id", "granted-id"]),
+            patch(
+                "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.MCPRequestHandler.get_allowed_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=["granted-id", "other-id"],
+            ),
+            patch.object(
+                MCPServerManager, "_get_active_submitted_mcp_server_ids_for_user", new_callable=AsyncMock, return_value=[]
+            ),
+        ):
+            allowed = await manager.get_allowed_mcp_servers(auth)
+        assert sorted(allowed) == ["granted-id", "open-id", "other-id"]
 
     @pytest.mark.asyncio
     async def test_get_allowed_mcp_servers_scopes_past_operator_open_union(self):
