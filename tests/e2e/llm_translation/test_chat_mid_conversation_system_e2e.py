@@ -321,3 +321,23 @@ class TestBedrockInvokeChatMidConversationSystem:
         _assert_unflagged_model_converts_and_succeeds(
             client, resources, _invoke_params(self.UNFLAGGED_MODEL, self.AWS_REGION)
         )
+
+class TestBedrockConverseChatMidConversationSystem:
+    """Converse builds its own request shape, so it hoists system messages in
+    ``AmazonConverseConfig._transform_system_message`` rather than through
+    ``AnthropicConfig``. Its ``Message`` role is user/assistant only, so there is
+    no flagged lane here: every mid-conversation reminder is converted in place."""
+
+    MODEL = "bedrock/converse/us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    AWS_REGION = "us-east-1"
+
+    @pytest.mark.covers(
+        "llm.chat_completions.bedrock_converse.mid_conversation_system.nonstream.cache_hit",
+        exercised_on=[],
+    )
+    def test_reminder_is_converted_in_place_and_keeps_the_prompt_cache(
+        self, client: PassthroughClient, resources: ResourceManager
+    ) -> None:
+        _assert_unflagged_model_converts_and_succeeds(
+            client, resources, _invoke_params(self.MODEL, self.AWS_REGION)
+        )
