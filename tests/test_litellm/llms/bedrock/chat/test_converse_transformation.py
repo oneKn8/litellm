@@ -6396,3 +6396,119 @@ def test_disabled_thinking_omitted_for_always_on_models_converse(
         assert "thinking" not in additional
     else:
         assert additional.get("thinking") == {"type": "disabled"}
+
+
+# --------------------------------------------------------------------------- #
+# Mid-conversation system messages (#36559 on the Converse route)
+# --------------------------------------------------------------------------- #
+
+_CONVERSE_MODEL = "anthropic.claude-haiku-4-5-20251001-v1:0"
+
+
+def _converse_request(messages: list, model: str = _CONVERSE_MODEL) -> dict:
+    return AmazonConverseConfig()._transform_request(
+        model=model,
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+    )
+
+
+def _texts(blocks: list) -> list[str]:
+    return [block["text"] for block in blocks if "text" in block]
+
+
+def test_leading_system_run_is_still_hoisted_to_the_system_field():
+    request = _converse_request(
+        [
+            {"role": "system", "content": "You are terse."},
+            {"role": "system", "content": "Answer in one line."},
+            {"role": "user", "content": "hello"},
+        ]
+    )
+    assert _texts(request["system"]) == ["You are terse.", "Answer in one line."]
+    assert [message["role"] for message in request["messages"]] == ["user"]
+
+
+def test_mid_conversation_system_never_reaches_the_system_field():
+    request = _converse_request(
+        [
+            {"role": "system", "content": "You are terse."},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "system", "content": "Reminder: stay terse."},
+            {"role": "user", "content": "again?"},
+        ]
+    )
+    assert _texts(request["system"]) == ["You are terse."]
+    assert "Reminder: stay terse." in json.dumps(request["messages"])
+
+
+def test_mid_conversation_system_keeps_its_position_in_the_conversation():
+    request = _converse_request(
+        [
+            {"role": "system", "content": "You are terse."},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "system", "content": "Reminder: stay terse."},
+            {"role": "user", "content": "again?"},
+        ]
+    )
+    reminder_turn = next(
+        index
+        for index, message in enumerate(request["messages"])
+        if "Reminder: stay terse." in json.dumps(message)
+    )
+    assistant_turn = next(
+        index for index, message in enumerate(request["messages"]) if message["role"] == "assistant"
+    )
+    assert reminder_turn > assistant_turn
+
+
+def test_the_cached_prefix_is_unchanged_by_a_trailing_reminder():
+    """The whole point: appending a reminder must not rewrite what came before it."""
+    prefix = [
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+    ]
+    without = _converse_request(list(prefix))
+    with_reminder = _converse_request(
+        [*prefix, {"role": "system", "content": "Reminder: stay terse."}, {"role": "user", "content": "again?"}]
+    )
+    assert with_reminder["system"] == without["system"]
+    assert with_reminder["messages"][: len(without["messages"])] == without["messages"]
+
+
+def test_a_mid_conversation_reminder_keeps_its_cache_point():
+    request = _converse_request(
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Reminder: stay terse.",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            {"role": "user", "content": "again?"},
+        ]
+    )
+    assert "cachePoint" in json.dumps(request["messages"])
+
+
+def test_transform_request_does_not_mutate_the_caller_messages():
+    messages = [
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+        {"role": "system", "content": "Reminder: stay terse."},
+        {"role": "user", "content": "again?"},
+    ]
+    snapshot = json.loads(json.dumps(messages))
+    _converse_request(messages)
+    assert messages == snapshot

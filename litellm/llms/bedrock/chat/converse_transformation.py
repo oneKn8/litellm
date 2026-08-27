@@ -40,6 +40,10 @@ from litellm.llms.anthropic.chat.transformation import (
     AnthropicConfig,
 )
 from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+from litellm.llms.anthropic.mid_conversation_system import (
+    place_mid_conversation_system,
+    split_leading_system_run,
+)
 from litellm.llms.base_llm.chat.transformation import BaseConfig, BaseLLMException
 from litellm.llms.bedrock.request_metadata import (
     bedrock_request_metadata_headers,
@@ -1165,11 +1169,18 @@ class AmazonConverseConfig(BaseConfig):
     def _transform_system_message(
         self, messages: list[AllMessageValues], model: str | None = None
     ) -> tuple[list[AllMessageValues], list[SystemContentBlock]]:
-        system_prompt_indices: Final = []
-        system_content_blocks: Final[list[SystemContentBlock]] = []
-        for idx, message in enumerate(messages):
+        """Hoist only the leading system run; leave a later one where the caller put it.
+
+        Hoisting a mid-conversation reminder rewrites the top of the request, which is the
+        prefix the provider matched the prompt cache against, so every reminder re-bills the
+        whole conversation at cache-write pricing (#36559). Converse has no system role
+        inside ``messages``, so a later run is always converted to a user turn in place.
+        """
+        leading_system_run, later_messages = split_leading_system_run(messages)
+        system_content_blocks: Final[list[SystemContentBlock]] = []  # mutable-ok: accumulated across the leading run
+        for message in leading_system_run:
+            # Always true for the leading run; the check is what narrows the union to a system message.
             if message["role"] == "system":
-                system_prompt_indices.append(idx)
                 if isinstance(message["content"], str) and message["content"]:
                     system_content_blocks.append(SystemContentBlock(text=message["content"]))
                     cache_block = self.get_cache_point_block(message, block_type="system", model=model)
@@ -1182,10 +1193,8 @@ class AmazonConverseConfig(BaseConfig):
                             cache_block = self.get_cache_point_block(m, block_type="system", model=model)
                             if cache_block:
                                 system_content_blocks.append(cache_block)
-        if len(system_prompt_indices) > 0:
-            for idx in reversed(system_prompt_indices):
-                messages.pop(idx)
-        return messages, system_content_blocks
+        conversation: Final = place_mid_conversation_system(later_messages, supports_mid_conversation_system=False)
+        return list(conversation), system_content_blocks  # mutable-ok: callers keep editing the returned list
 
     def _transform_inference_params(self, inference_params: dict) -> InferenceConfig:
         if "top_k" in inference_params:
